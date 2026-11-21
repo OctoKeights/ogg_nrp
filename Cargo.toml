@@ -1,0 +1,28 @@
+[package]
+name = "ogg_nrp"
+description = "The Ogg container in pure, safe Rust: a native port of Xiph.Org's libogg, byte for byte, with pages and packets in both directions and its bit packers."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "BSD-3-Clause"
+repository = "https://github.com/OctoKeights/ogg_nrp"
+readme = "README.md"
+keywords = ["ogg", "libogg", "container", "xiph", "multimedia"]
+categories = ["multimedia", "multimedia::encoding", "parser-implementations"]
+
+[dependencies]
+
+[lints.rust]
+# No unsafe code in the library, its tests or examples.
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Integer conversions that narrow or reinterpret are the container's arithmetic, as they are
+# in the original's C; each is deliberate, so these three are not flagged.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_sign_loss = "allow"
+# Flags clear pairs of names such as a packet's file and fill.
+similar_names = "allow"
