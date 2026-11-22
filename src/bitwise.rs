@@ -8,7 +8,10 @@
 //! for writing and for reading. Here a writer owns its bytes, and a reader
 //! borrows the bytes it reads.
 
+use alloc::{vec, vec::Vec};
+
 const BUFFER_INCREMENT: usize = 256;
+const MAX_WRITER_BYTES: usize = (usize::MAX - 7) / 8;
 
 #[allow(clippy::unreadable_literal)] // as libogg writes it
 const MASK: [u64; 33] = [
@@ -58,6 +61,18 @@ impl<const MSB: bool> PackWriterOf<MSB> {
         }
     }
 
+    /// Creates a writer pre-allocated to hold at least `capacity` written bytes
+    /// without reallocating.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        let storage = capacity.saturating_add(4).max(5);
+        Self {
+            buffer: vec![0; storage],
+            endbyte: 0,
+            endbit: 0,
+        }
+    }
+
     /// `oggpack_writecheck`: 0 while the writer is good, and -1 once it has been
     /// cleared.
     #[must_use]
@@ -65,21 +80,23 @@ impl<const MSB: bool> PackWriterOf<MSB> {
         if self.buffer.is_empty() { -1 } else { 0 }
     }
 
-    /// `oggpack_writetrunc`: cuts what was written back to `bits` bits.
+    /// `oggpack_writetrunc`: cuts what was written back to `bits` bits. If
+    /// `bits` exceeds [`bits`](Self::bits), it is clamped to what has been
+    /// written so far.
     pub fn writetrunc(&mut self, bits: usize) {
+        if self.buffer.is_empty() {
+            return;
+        }
+        let bits = bits.min(self.bits());
         let bytes = bits >> 3;
-        if !self.buffer.is_empty() {
-            let bits = bits - bytes * 8;
-            self.endbit = bits as u32;
-            self.endbyte = bytes;
-            // The C library writes through its pointer wherever it lands. Past what was
-            // written, there is no byte here to trim.
-            if let Some(byte) = self.buffer.get_mut(bytes) {
-                if MSB {
-                    *byte &= MASK8B[bits];
-                } else {
-                    *byte &= MASK[bits] as u8;
-                }
+        let rem = bits - bytes * 8;
+        self.endbit = rem as u32;
+        self.endbyte = bytes;
+        if let Some(byte) = self.buffer.get_mut(bytes) {
+            if MSB {
+                *byte &= MASK8B[rem];
+            } else {
+                *byte &= MASK[rem] as u8;
             }
         }
     }
@@ -90,11 +107,24 @@ impl<const MSB: bool> PackWriterOf<MSB> {
             self.writeclear();
             return;
         }
-        if self.endbyte as i64 >= self.buffer.len() as i64 - 4 {
-            if self.buffer.is_empty() {
+        if self.buffer.is_empty() {
+            return;
+        }
+        if self.endbyte >= self.buffer.len().saturating_sub(4) {
+            let Some(min_len) = self.endbyte.checked_add(5) else {
+                self.writeclear();
+                return;
+            };
+            let Some(grow_len) = self.buffer.len().checked_add(BUFFER_INCREMENT) else {
+                self.writeclear();
+                return;
+            };
+            let new_len = grow_len.max(min_len);
+            if new_len > MAX_WRITER_BYTES {
+                self.writeclear();
                 return;
             }
-            self.buffer.resize(self.buffer.len() + BUFFER_INCREMENT, 0);
+            self.buffer.resize(new_len, 0);
         }
         let at = self.endbyte;
         let endbit = self.endbit;
@@ -154,21 +184,34 @@ impl<const MSB: bool> PackWriterOf<MSB> {
     /// order. A `source` shorter than that clears the writer, as its other errors
     /// do.
     pub fn writecopy(&mut self, source: &[u8], bits: usize) {
+        if self.buffer.is_empty() {
+            return;
+        }
         let bytes = bits / 8;
-        let pbytes = (self.endbit as usize + bits) / 8;
-        let bits = bits - bytes * 8;
-        if source.len() < bytes + usize::from(bits != 0) {
+        let rem_bits = bits - bytes * 8;
+        if source.len() < bytes + usize::from(rem_bits != 0) {
+            self.writeclear();
+            return;
+        }
+        let Some(pbytes) = (self.endbit as usize).checked_add(bits).map(|n| n / 8) else {
+            self.writeclear();
+            return;
+        };
+        let Some(needed_end) = self.endbyte.checked_add(pbytes) else {
+            self.writeclear();
+            return;
+        };
+        if needed_end > MAX_WRITER_BYTES {
             self.writeclear();
             return;
         }
         // Expand storage up-front.
-        if self.endbyte + pbytes >= self.buffer.len() {
-            if self.buffer.is_empty() {
+        if needed_end >= self.buffer.len().saturating_sub(4) {
+            let Some(new_len) = needed_end.checked_add(BUFFER_INCREMENT) else {
                 self.writeclear();
                 return;
-            }
-            self.buffer
-                .resize(self.endbyte + pbytes + BUFFER_INCREMENT, 0);
+            };
+            self.buffer.resize(new_len, 0);
         }
         // Copy whole octets.
         if self.endbit != 0 {
@@ -183,11 +226,11 @@ impl<const MSB: bool> PackWriterOf<MSB> {
             self.buffer[self.endbyte] = 0;
         }
         // Copy trailing bits.
-        if bits != 0 {
+        if rem_bits != 0 {
             if MSB {
-                self.write(u32::from(source[bytes] >> (8 - bits)), bits as i32);
+                self.write(u32::from(source[bytes] >> (8 - rem_bits)), rem_bits as i32);
             } else {
-                self.write(u32::from(source[bytes]), bits as i32);
+                self.write(u32::from(source[bytes]), rem_bits as i32);
             }
         }
     }
@@ -225,6 +268,18 @@ impl<const MSB: bool> PackWriterOf<MSB> {
     #[must_use]
     pub fn get_buffer(&self) -> &[u8] {
         &self.buffer[..self.bytes().min(self.buffer.len())]
+    }
+
+    /// Consumes the writer and returns the written bytes as a [`Vec<u8>`] without
+    /// copying, or `None` if the writer has been cleared by an invalid write.
+    #[must_use]
+    pub fn into_vec(mut self) -> Option<Vec<u8>> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let len = self.bytes().min(self.buffer.len());
+        self.buffer.truncate(len);
+        Some(self.buffer)
     }
 }
 
@@ -330,6 +385,14 @@ impl<'a, const MSB: bool> PackReaderOf<'a, MSB> {
         self.peek(bits, total)
     }
 
+    /// Peeks at the next `bits` bits (`0..=32`) as a `u32` without advancing, or
+    /// returns `None` when `bits > 32` or the remaining buffer is too short.
+    #[must_use]
+    pub fn try_look(&self, bits: u8) -> Option<u32> {
+        let got = self.look(i32::from(bits));
+        if got < 0 { None } else { Some(got as u32) }
+    }
+
     /// `oggpack_look1`: the next bit without moving on, or -1 at the end.
     #[must_use]
     pub fn look1(&self) -> i64 {
@@ -340,8 +403,13 @@ impl<'a, const MSB: bool> PackReaderOf<'a, MSB> {
         ((self.byte(0) >> shift) & 1) as i64
     }
 
-    /// `oggpack_adv`: moves on by `bits` bits.
+    /// `oggpack_adv`: moves on by `bits` bits. A negative `bits` marks the reader
+    /// as overflowed.
     pub fn adv(&mut self, bits: i32) {
+        if bits < 0 {
+            self.overflow();
+            return;
+        }
         let total = i64::from(bits) + self.endbit;
         if self.endbyte > self.storage() - ((total + 7) >> 3) {
             self.overflow();
@@ -363,6 +431,7 @@ impl<'a, const MSB: bool> PackReaderOf<'a, MSB> {
 
     /// `oggpack_read`: the next `bits` bits (0 to 32), or -1 when they are not
     /// there.
+    #[must_use]
     pub fn read(&mut self, bits: i32) -> i64 {
         if !(0..=32).contains(&bits) {
             return self.overflow();
@@ -383,7 +452,17 @@ impl<'a, const MSB: bool> PackReaderOf<'a, MSB> {
         ret
     }
 
+    /// Reads the next `bits` bits (`0..=32`) as a `u32`, or returns `None` (and
+    /// marks the reader as overflowed) when `bits > 32` or the remaining buffer
+    /// is too short.
+    #[must_use]
+    pub fn try_read(&mut self, bits: u8) -> Option<u32> {
+        let got = self.read(i32::from(bits));
+        if got < 0 { None } else { Some(got as u32) }
+    }
+
     /// `oggpack_read1`: the next bit, or -1 at the end.
+    #[must_use]
     pub fn read1(&mut self) -> i64 {
         if self.endbyte >= self.storage() {
             return self.overflow();
@@ -455,5 +534,85 @@ mod tests {
         assert_eq!(w.writecheck(), -1);
         w.write(1, 8);
         assert_eq!(w.bytes(), 0);
+        assert!(w.into_vec().is_none());
+    }
+
+    #[test]
+    fn adv_negative_marks_overflow_without_panic() {
+        let data = [0xa5u8, 0x5a, 0xff, 0x00, 0x12];
+        for neg in [-1, -8, -100, i32::MIN] {
+            let mut r = PackReader::new(&data);
+            assert_eq!(r.read(4), 0x5);
+            r.adv(neg);
+            assert_eq!(r.look(1), -1);
+            assert_eq!(r.look1(), -1);
+            assert_eq!(r.read(8), -1);
+            assert_eq!(r.read1(), -1);
+
+            let mut rb = PackReaderB::new(&data);
+            rb.adv(neg);
+            assert_eq!(rb.read(1), -1);
+        }
+    }
+
+    #[test]
+    fn writetrunc_past_written_and_usize_max_never_panics() {
+        let mut w = PackWriter::new();
+        w.write(0xabcd, 16);
+        // Truncating beyond written bits clamps to current written bits (16).
+        w.writetrunc(100_000);
+        assert_eq!(w.bits(), 16);
+        w.writetrunc(usize::MAX);
+        assert_eq!(w.bits(), 16);
+        // Subsequent writes must remain safe and accurate.
+        w.write(0xef, 8);
+        assert_eq!(w.bits(), 24);
+        assert_eq!(w.get_buffer(), [0xcd, 0xab, 0xef]);
+
+        let mut wb = PackWriterB::new();
+        wb.writetrunc(usize::MAX);
+        assert_eq!(wb.bits(), 0);
+        wb.write(0b101, 3);
+        assert_eq!(wb.get_buffer(), [0xa0]);
+    }
+
+    #[test]
+    fn writecopy_overflow_clears_without_panic() {
+        let mut w = PackWriter::new();
+        w.write(1, 3); // endbit != 0 so `endbit + usize::MAX` would previously overflow!
+        w.writecopy(&[0xff; 8], usize::MAX);
+        assert_eq!(w.writecheck(), -1);
+        assert_eq!(w.bytes(), 0);
+    }
+
+    #[test]
+    fn try_read_try_look_and_capacity_into_vec() {
+        let mut w = PackWriter::with_capacity(0);
+        assert_eq!(w.writecheck(), 0);
+        w.write(0xdead_beef, 32);
+        w.write(0b101, 3);
+        let vec = w.into_vec().unwrap();
+        assert_eq!(vec, [0xef, 0xbe, 0xad, 0xde, 0x05]);
+
+        let mut r = PackReader::new(&vec);
+        assert_eq!(r.try_look(33), None);
+        assert_eq!(r.try_look(32), Some(0xdead_beef));
+        assert_eq!(r.try_read(32), Some(0xdead_beef));
+        assert_eq!(r.try_read(3), Some(0b101));
+        assert_eq!(r.try_look(6), None);
+        assert_eq!(r.try_read(5), Some(0)); // remaining 5 zero-pad bits in the 5th byte
+        assert_eq!(r.try_look(1), None);
+        assert_eq!(r.try_read(1), None);
+        // Once overflowed, even 0-bit read returns None.
+        assert_eq!(r.try_read(0), None);
+
+        let mut w2 = PackWriterB::with_capacity(64);
+        for i in 0..64u32 {
+            w2.write(i, 8);
+        }
+        let out = w2.into_vec().unwrap();
+        assert_eq!(out.len(), 64);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[63], 63);
     }
 }

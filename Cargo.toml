@@ -8,9 +8,17 @@ license = "BSD-3-Clause"
 repository = "https://github.com/OctoKeights/ogg_nrp"
 readme = "README.md"
 keywords = ["ogg", "libogg", "container", "xiph", "multimedia"]
-categories = ["multimedia", "multimedia::encoding", "parser-implementations"]
+categories = ["multimedia", "multimedia::encoding", "parser-implementations", "no-std"]
+exclude = [".github/", "compare/", "clippy.toml", "rust-toolchain.toml"]
+
+[features]
+default = ["std"]
+std = []
 
 [dependencies]
+
+[profile.test]
+opt-level = 2
 
 [lints.rust]
 # No unsafe code in the library, its tests or examples.

@@ -55,8 +55,12 @@ fn packets(file: &[u8]) -> Vec<Vec<u8>> {
         if stream.pagein(&page) != 0 {
             continue; // a page of another stream
         }
-        while let (1, Some(packet)) = stream.packetout() {
-            found.push(packet.packet.to_vec());
+        loop {
+            match stream.packetout() {
+                (0, None) => break, // no more whole packets on this page
+                (1, Some(packet)) => found.push(packet.packet.to_vec()),
+                _ => {} // -1: a hole before the next packet; keep reading
+            }
         }
     }
     found

@@ -2,6 +2,11 @@
 //! and come out as pages. The bytes of a file go into a [`SyncState`] and come
 //! out as pages, which go into a [`StreamState`] and come out as packets.
 
+use alloc::{vec, vec::Vec};
+
+const MAX_STREAM_STORAGE: usize = i32::MAX as usize;
+const MAX_SYNC_STORAGE: usize = (i32::MAX as usize) - 4096;
+
 /// The CRC tables of `crctable.h`, worked out when the crate is built: the
 /// Ethernet generator polynomial, unreflected, with a start and an end value of
 /// 0, as slices of eight.
@@ -31,23 +36,20 @@ const CRC_LOOKUP: [[u32; 256]; 8] = {
     table
 };
 
-fn update_crc(mut crc: u32, mut buffer: &[u8]) -> u32 {
-    while buffer.len() >= 8 {
-        crc ^= u32::from(buffer[0]) << 24
-            | u32::from(buffer[1]) << 16
-            | u32::from(buffer[2]) << 8
-            | u32::from(buffer[3]);
+fn update_crc(mut crc: u32, buffer: &[u8]) -> u32 {
+    let (chunks, remainder) = buffer.as_chunks::<8>();
+    for chunk in chunks {
+        crc ^= u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         crc = CRC_LOOKUP[7][(crc >> 24) as usize]
             ^ CRC_LOOKUP[6][((crc >> 16) & 0xFF) as usize]
             ^ CRC_LOOKUP[5][((crc >> 8) & 0xFF) as usize]
             ^ CRC_LOOKUP[4][(crc & 0xFF) as usize]
-            ^ CRC_LOOKUP[3][usize::from(buffer[4])]
-            ^ CRC_LOOKUP[2][usize::from(buffer[5])]
-            ^ CRC_LOOKUP[1][usize::from(buffer[6])]
-            ^ CRC_LOOKUP[0][usize::from(buffer[7])];
-        buffer = &buffer[8..];
+            ^ CRC_LOOKUP[3][usize::from(chunk[4])]
+            ^ CRC_LOOKUP[2][usize::from(chunk[5])]
+            ^ CRC_LOOKUP[1][usize::from(chunk[6])]
+            ^ CRC_LOOKUP[0][usize::from(chunk[7])];
     }
-    for &byte in buffer {
+    for &byte in remainder {
         crc = (crc << 8) ^ CRC_LOOKUP[0][(((crc >> 24) & 0xff) ^ u32::from(byte)) as usize];
     }
     crc
@@ -82,7 +84,7 @@ pub fn page_checksum_set(header: &mut [u8], body: &[u8]) {
 
 /// One page of an Ogg stream (`ogg_page`): its header (27 bytes and the segment
 /// table) and its body, borrowed from the state that made or found it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Page<'a> {
     /// The header: 27 bytes, then the segment table.
     pub header: &'a [u8],
@@ -91,72 +93,94 @@ pub struct Page<'a> {
 }
 
 impl Page<'_> {
-    /// `ogg_page_version`: the stream structure version (0).
+    /// `ogg_page_version`: the stream structure version (0), or -1 if `header` is
+    /// shorter than 5 bytes.
     #[must_use]
     pub fn version(&self) -> i32 {
-        i32::from(self.header[4])
+        self.header.get(4).map_or(-1, |&b| i32::from(b))
     }
 
     /// `ogg_page_continued`: the page begins with the rest of a packet begun before
-    /// it.
+    /// it (`false` if `header` is shorter than 6 bytes).
     #[must_use]
     pub fn continued(&self) -> bool {
-        self.header[5] & 0x01 != 0
+        self.header.get(5).is_some_and(|&b| b & 0x01 != 0)
     }
 
-    /// `ogg_page_bos`: the first page of its stream.
+    /// `ogg_page_bos`: the first page of its stream (`false` if `header` is
+    /// shorter than 6 bytes).
     #[must_use]
     pub fn bos(&self) -> bool {
-        self.header[5] & 0x02 != 0
+        self.header.get(5).is_some_and(|&b| b & 0x02 != 0)
     }
 
-    /// `ogg_page_eos`: the last page of its stream.
+    /// `ogg_page_eos`: the last page of its stream (`false` if `header` is shorter
+    /// than 6 bytes).
     #[must_use]
     pub fn eos(&self) -> bool {
-        self.header[5] & 0x04 != 0
+        self.header.get(5).is_some_and(|&b| b & 0x04 != 0)
     }
 
     /// `ogg_page_granulepos`: the position of the last packet that ends on this
-    /// page (-1 when none does).
+    /// page (-1 when none does, or when `header` is shorter than 14 bytes).
     #[must_use]
     pub fn granulepos(&self) -> i64 {
-        let mut bytes = [0u8; 8];
-        bytes.copy_from_slice(&self.header[6..14]);
-        i64::from_le_bytes(bytes)
+        self.header
+            .get(6..14)
+            .and_then(|s| s.try_into().ok())
+            .map_or(-1, i64::from_le_bytes)
     }
 
-    /// `ogg_page_serialno`: the number of the stream the page belongs to.
+    /// `ogg_page_serialno`: the number of the stream the page belongs to (0 if
+    /// `header` is shorter than 18 bytes).
     #[must_use]
     pub fn serialno(&self) -> i32 {
-        let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&self.header[14..18]);
-        i32::from_le_bytes(bytes)
+        self.header
+            .get(14..18)
+            .and_then(|s| s.try_into().ok())
+            .map_or(0, i32::from_le_bytes)
     }
 
-    /// `ogg_page_pageno`: the page's number in its stream (never negative: the C
-    /// library's `long` where it has 64 bits).
+    /// `ogg_page_pageno`: the page's number in its stream (never negative on a
+    /// complete header: the C library's `long` where it has 64 bits; -1 if `header`
+    /// is shorter than 22 bytes).
     #[must_use]
     pub fn pageno(&self) -> i64 {
-        let mut bytes = [0u8; 4];
-        bytes.copy_from_slice(&self.header[18..22]);
-        i64::from(u32::from_le_bytes(bytes))
+        self.header
+            .get(18..22)
+            .and_then(|s| s.try_into().ok())
+            .map_or(-1, |bytes| i64::from(u32::from_le_bytes(bytes)))
     }
 
     /// `ogg_page_packets`: the packets that end on this page (one begun on an
-    /// earlier page counts, and one that goes on to the next does not).
+    /// earlier page counts, and one that goes on to the next does not; 0 if
+    /// `header` is too short for its segment table).
     #[must_use]
     pub fn packets(&self) -> i32 {
-        let n = usize::from(self.header[26]);
-        self.header[27..27 + n]
-            .iter()
-            .filter(|&&lacing| lacing < 255)
-            .count() as i32
+        let Some(&n) = self.header.get(26) else {
+            return 0;
+        };
+        let Some(segments) = self.header.get(27..27 + usize::from(n)) else {
+            return 0;
+        };
+        segments.iter().filter(|&&lacing| lacing < 255).count() as i32
+    }
+
+    /// Writes this page's `header` followed by its `body` to `writer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error reported by `writer`.
+    #[cfg(feature = "std")]
+    pub fn write_to<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        writer.write_all(self.header)?;
+        writer.write_all(self.body)
     }
 }
 
 /// One packet (`ogg_packet`): its bytes, borrowed, and what the framing knows
 /// of it.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Packet<'a> {
     /// The packet's bytes (the C library's `packet` and `bytes`).
     pub packet: &'a [u8],
@@ -170,6 +194,89 @@ pub struct Packet<'a> {
     /// The packet's number in its stream. The framing knows where there is a hole
     /// in the data, and this is how the codec gets to know it.
     pub packetno: i64,
+}
+
+impl<'a> Packet<'a> {
+    /// Creates a packet wrapping `bytes` with `granulepos` set to `-1` and
+    /// stream flags and counter set to `0`.
+    #[must_use]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            packet: bytes,
+            b_o_s: 0,
+            e_o_s: 0,
+            granulepos: -1,
+            packetno: 0,
+        }
+    }
+
+    /// Whether this packet is marked as the beginning of its logical stream
+    /// (`self.b_o_s != 0`).
+    #[must_use]
+    pub const fn bos(&self) -> bool {
+        self.b_o_s != 0
+    }
+
+    /// Whether this packet is marked as the end of its logical stream
+    /// (`self.e_o_s != 0`).
+    #[must_use]
+    pub const fn eos(&self) -> bool {
+        self.e_o_s != 0
+    }
+}
+
+/// Typed outcome of [`SyncState::next_page`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PageOut<'a> {
+    /// A complete, checksum-verified page was extracted.
+    Page(Page<'a>),
+    /// More input bytes are needed before a complete page is available.
+    NeedData,
+    /// Unsynced or damaged bytes were skipped to find the next page boundary.
+    Hole,
+}
+
+impl<'a> PageOut<'a> {
+    /// Returns the extracted [`Page`] if this is [`PageOut::Page`], or `None`
+    /// otherwise.
+    #[must_use]
+    pub const fn into_page(self) -> Option<Page<'a>> {
+        match self {
+            Self::Page(page) => Some(page),
+            Self::NeedData | Self::Hole => None,
+        }
+    }
+}
+
+/// Typed outcome of [`StreamState::next_packet`] and [`StreamState::peek_packet`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PacketOut<'a> {
+    /// A complete packet was assembled from the stream's pages.
+    Packet(Packet<'a>),
+    /// More pages are needed before a complete packet is available (or the stream
+    /// is cleared or in encode mode).
+    NeedData,
+    /// Data was missing before the next packet (a gap in page sequence numbers).
+    Hole,
+}
+
+impl<'a> PacketOut<'a> {
+    /// Returns the assembled [`Packet`] if this is [`PacketOut::Packet`], or
+    /// `None` otherwise.
+    #[must_use]
+    pub const fn into_packet(self) -> Option<Packet<'a>> {
+        match self {
+            Self::Packet(packet) => Some(packet),
+            Self::NeedData | Self::Hole => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamMode {
+    Idle,
+    Reading,
+    Writing,
 }
 
 /// A logical stream being written or read (`ogg_stream_state`).
@@ -200,6 +307,7 @@ pub struct StreamState {
     pageno: i64,
     packetno: i64,
     granulepos: i64,
+    mode: StreamMode,
     /// After `clear` the C library's state has no storage and every call fails.
     cleared: bool,
 }
@@ -225,6 +333,7 @@ impl StreamState {
             pageno: 0,
             packetno: 0,
             granulepos: 0,
+            mode: StreamMode::Idle,
             cleared: false,
         }
     }
@@ -239,10 +348,23 @@ impl StreamState {
     /// `ogg_stream_clear`: frees the storage. Every later call fails, as in the C
     /// library.
     pub fn clear(&mut self) {
-        *self = Self::new(0);
         self.body_data = Vec::new();
+        self.body_fill = 0;
+        self.body_returned = 0;
         self.lacing_vals = Vec::new();
         self.granule_vals = Vec::new();
+        self.lacing_fill = 0;
+        self.lacing_packet = 0;
+        self.lacing_returned = 0;
+        self.header = [0; 282];
+        self.header_fill = 0;
+        self.e_o_s = false;
+        self.b_o_s = false;
+        self.serialno = 0;
+        self.pageno = 0;
+        self.packetno = 0;
+        self.granulepos = 0;
+        self.mode = StreamMode::Idle;
         self.cleared = true;
     }
 
@@ -252,27 +374,60 @@ impl StreamState {
         self.serialno
     }
 
-    fn body_expand(&mut self, needed: usize) {
-        if self.body_data.len() as i64 - needed as i64 <= self.body_fill as i64 {
-            self.body_data
-                .resize(self.body_data.len() + needed + 1024, 0);
+    fn body_expand(&mut self, needed: usize) -> bool {
+        if needed >= self.body_data.len() - self.body_fill {
+            let Some(mut storage) = self.body_data.len().checked_add(needed) else {
+                self.clear();
+                return false;
+            };
+            if storage > MAX_STREAM_STORAGE {
+                self.clear();
+                return false;
+            }
+            if storage < MAX_STREAM_STORAGE - 1024 {
+                storage += 1024;
+            }
+            self.body_data.resize(storage, 0);
         }
+        true
     }
 
-    fn lacing_expand(&mut self, needed: usize) {
-        if self.lacing_vals.len() as i64 - needed as i64 <= self.lacing_fill as i64 {
-            let storage = self.lacing_vals.len() + needed + 32;
+    fn lacing_expand(&mut self, needed: usize) -> bool {
+        if needed >= self.lacing_vals.len() - self.lacing_fill {
+            let Some(mut storage) = self.lacing_vals.len().checked_add(needed) else {
+                self.clear();
+                return false;
+            };
+            if storage > MAX_STREAM_STORAGE {
+                self.clear();
+                return false;
+            }
+            if storage < MAX_STREAM_STORAGE - 32 {
+                storage += 32;
+            }
             self.lacing_vals.resize(storage, 0);
             self.granule_vals.resize(storage, 0);
         }
+        true
     }
 
     /// `ogg_stream_iovecin`: one packet given as pieces, to go into pages.
     pub fn iovecin(&mut self, iov: &[&[u8]], e_o_s: bool, granulepos: i64) -> i32 {
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Reading {
             return -1;
         }
-        let bytes: usize = iov.iter().map(|piece| piece.len()).sum();
+        self.mode = StreamMode::Writing;
+
+        let mut bytes = 0usize;
+        for piece in iov {
+            if piece.len() > MAX_STREAM_STORAGE {
+                return -1;
+            }
+            match bytes.checked_add(piece.len()) {
+                Some(sum) if sum <= MAX_STREAM_STORAGE => bytes = sum,
+                _ => return -1,
+            }
+        }
         let lacing_vals = bytes / 255 + 1;
 
         if self.body_returned != 0 {
@@ -286,9 +441,26 @@ impl StreamState {
             self.body_returned = 0;
         }
 
+        if self.lacing_returned != 0 {
+            // Compact any lacing values already flushed into pages.
+            self.lacing_fill -= self.lacing_returned;
+            if self.lacing_fill != 0 {
+                self.lacing_vals.copy_within(
+                    self.lacing_returned..self.lacing_returned + self.lacing_fill,
+                    0,
+                );
+                self.granule_vals.copy_within(
+                    self.lacing_returned..self.lacing_returned + self.lacing_fill,
+                    0,
+                );
+            }
+            self.lacing_returned = 0;
+        }
+
         // Make sure we have the buffer storage.
-        self.body_expand(bytes);
-        self.lacing_expand(lacing_vals);
+        if !self.body_expand(bytes) || !self.lacing_expand(lacing_vals) {
+            return -1;
+        }
 
         // Copy in the submitted packet.
         for piece in iov {
@@ -330,15 +502,19 @@ impl StreamState {
     /// size are flushed, and with it, a page is flushed as long as there is any
     /// data at all.
     fn flush_i(&mut self, mut force: bool, nfill: i32) -> Option<Page<'_>> {
-        let maxvals = self.lacing_fill.min(255);
+        if self.check() != 0 || self.mode == StreamMode::Reading {
+            return None;
+        }
+        self.mode = StreamMode::Writing;
+
+        let lr = self.lacing_returned;
+        let rem = self.lacing_fill - lr;
+        let maxvals = rem.min(255);
         let mut vals = 0;
         let mut bytes = 0usize;
         let mut acc: i64 = 0;
         let mut granule_pos: i64 = -1;
 
-        if self.check() != 0 {
-            return None;
-        }
         if maxvals == 0 {
             return None;
         }
@@ -355,9 +531,10 @@ impl StreamState {
                     force = true;
                     break;
                 }
-                acc += i64::from(self.lacing_vals[vals] & 0x0ff);
-                if (self.lacing_vals[vals] & 0xff) < 255 {
-                    granule_pos = self.granule_vals[vals];
+                let lv = self.lacing_vals[lr + vals];
+                acc += i64::from(lv & 0x0ff);
+                if (lv & 0xff) < 255 {
+                    granule_pos = self.granule_vals[lr + vals];
                     packets_done += 1;
                     packet_just_done = packets_done;
                 } else {
@@ -372,7 +549,7 @@ impl StreamState {
             // The initial header page: it must only include the initial header packet.
             granule_pos = 0;
             while vals < maxvals {
-                if (self.lacing_vals[vals] & 0x0ff) < 255 {
+                if (self.lacing_vals[lr + vals] & 0x0ff) < 255 {
                     vals += 1;
                     break;
                 }
@@ -392,7 +569,7 @@ impl StreamState {
 
         // Continued packet flag?
         self.header[5] = 0x00;
-        if self.lacing_vals[0] & 0x100 == 0 {
+        if self.lacing_vals[lr] & 0x100 == 0 {
             self.header[5] |= 0x01;
         }
         // First page flag?
@@ -400,7 +577,7 @@ impl StreamState {
             self.header[5] |= 0x02;
         }
         // Last page flag?
-        if self.e_o_s && self.lacing_fill == vals {
+        if self.e_o_s && rem == vals {
             self.header[5] |= 0x04;
         }
         self.b_o_s = true;
@@ -426,7 +603,7 @@ impl StreamState {
         // Segment table.
         self.header[26] = (vals & 0xff) as u8;
         for i in 0..vals {
-            let lacing = (self.lacing_vals[i] & 0xff) as u8;
+            let lacing = (self.lacing_vals[lr + i] & 0xff) as u8;
             self.header[i + 27] = lacing;
             bytes += usize::from(lacing);
         }
@@ -434,12 +611,12 @@ impl StreamState {
         self.header_fill = vals + 27;
         let body_at = self.body_returned;
 
-        // Advance the lacing data and set the body_returned pointer.
-        self.lacing_fill -= vals;
-        self.lacing_vals
-            .copy_within(vals..vals + self.lacing_fill, 0);
-        self.granule_vals
-            .copy_within(vals..vals + self.lacing_fill, 0);
+        // Advance the lacing cursor and set the body_returned pointer.
+        self.lacing_returned += vals;
+        if self.lacing_returned == self.lacing_fill {
+            self.lacing_returned = 0;
+            self.lacing_fill = 0;
+        }
         self.body_returned += bytes;
 
         // Calculate the checksum.
@@ -458,25 +635,28 @@ impl StreamState {
     /// `ogg_stream_flush`: a page of what is buffered, even an undersized one, or
     /// `None` when nothing is. It flushes one page of the usual size at a time, so
     /// only `None` says that all packets have gone into pages.
+    #[must_use]
     pub fn flush(&mut self) -> Option<Page<'_>> {
         self.flush_i(true, 4096)
     }
 
     /// `ogg_stream_flush_fill`: [`flush`](Self::flush), with the nominal page size
     /// given.
+    #[must_use]
     pub fn flush_fill(&mut self, nfill: i32) -> Option<Page<'_>> {
         self.flush_i(true, nfill)
     }
 
     fn pageout_force(&self) -> bool {
         // "We're done, now flush", and the initial header page.
-        self.lacing_fill != 0 && (self.e_o_s || !self.b_o_s)
+        self.lacing_fill > self.lacing_returned && (self.e_o_s || !self.b_o_s)
     }
 
     /// `ogg_stream_pageout`: a page, once enough is buffered for one. The page is
     /// good until the next call on this stream.
+    #[must_use]
     pub fn pageout(&mut self) -> Option<Page<'_>> {
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Reading {
             return None;
         }
         let force = self.pageout_force();
@@ -485,8 +665,9 @@ impl StreamState {
 
     /// `ogg_stream_pageout_fill`: [`pageout`](Self::pageout), with the nominal page
     /// size given.
+    #[must_use]
     pub fn pageout_fill(&mut self, nfill: i32) -> Option<Page<'_>> {
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Reading {
             return None;
         }
         let force = self.pageout_force();
@@ -504,28 +685,25 @@ impl StreamState {
     }
 
     /// `ogg_stream_pagein`: adds a page read from a file to the stream, cut into
-    /// packet segments. Returns -1 when the page is of another stream or version.
+    /// packet segments. Returns -1 when the page is of another stream or version,
+    /// truncated, or when the stream is cleared or in encode mode.
     #[allow(clippy::too_many_lines)] // libogg's function, kept whole
     pub fn pagein(&mut self, og: &Page) -> i32 {
-        let header = og.header;
-        let mut body = og.body;
-        let mut segptr = 0usize;
-
-        let version = og.version();
-        let continued = og.continued();
-        let mut bos = og.bos();
-        let eos = og.eos();
-        let granulepos = og.granulepos();
-        let serialno = og.serialno();
-        let pageno = og.pageno();
-        let segments = usize::from(header[26]);
-
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Writing {
             return -1;
         }
+        self.mode = StreamMode::Reading;
+
+        let header = og.header;
+        let mut body = og.body;
+
         // A page from a `SyncState` or a `StreamState` is always whole. One put
         // together by hand whose lengths disagree with its segment table is not taken,
         // where the C library reads past its end.
+        if header.len() < 27 {
+            return -1;
+        }
+        let segments = usize::from(header[26]);
         if header.len() < 27 + segments
             || body.len()
                 != header[27..27 + segments]
@@ -535,6 +713,15 @@ impl StreamState {
         {
             return -1;
         }
+
+        let mut segptr = 0usize;
+        let version = og.version();
+        let continued = og.continued();
+        let mut bos = og.bos();
+        let eos = og.eos();
+        let granulepos = og.granulepos();
+        let serialno = og.serialno();
+        let pageno = og.pageno();
 
         // Clean up 'returned data'.
         {
@@ -570,7 +757,9 @@ impl StreamState {
             return -1;
         }
 
-        self.lacing_expand(segments + 1);
+        if !self.lacing_expand(segments + 1) {
+            return -1;
+        }
 
         // Are we in sequence?
         if pageno != self.pageno {
@@ -606,7 +795,9 @@ impl StreamState {
         }
 
         if !body.is_empty() {
-            self.body_expand(body.len());
+            if !self.body_expand(body.len()) {
+                return -1;
+            }
             self.body_data[self.body_fill..self.body_fill + body.len()].copy_from_slice(body);
             self.body_fill += body.len();
         }
@@ -673,6 +864,7 @@ impl StreamState {
         self.pageno = -1;
         self.packetno = 0;
         self.granulepos = 0;
+        self.mode = StreamMode::Idle;
         0
     }
 
@@ -685,6 +877,12 @@ impl StreamState {
         self.reset();
         self.serialno = i64::from(serialno);
         0
+    }
+
+    pub(crate) fn has_ready_packet(&self) -> bool {
+        self.check() == 0
+            && self.mode != StreamMode::Writing
+            && self.lacing_packet > self.lacing_returned
     }
 
     /// The last part of decode: the stream is broken into packet segments, which
@@ -747,20 +945,45 @@ impl StreamState {
     /// there is not a whole one yet, and -1 where data is missing before the next
     /// one (a hole: ask again). The packet is good until the next call on this
     /// stream.
+    #[must_use]
     pub fn packetout(&mut self) -> (i32, Option<Packet<'_>>) {
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Writing {
             return (0, None);
         }
+        self.mode = StreamMode::Reading;
         self.packetout_i(true)
     }
 
     /// `ogg_stream_packetpeek`: [`packetout`](Self::packetout) without taking the
     /// packet out (a hole is still passed over).
+    #[must_use]
     pub fn packetpeek(&mut self) -> (i32, Option<Packet<'_>>) {
-        if self.check() != 0 {
+        if self.check() != 0 || self.mode == StreamMode::Writing {
             return (0, None);
         }
+        self.mode = StreamMode::Reading;
         self.packetout_i(false)
+    }
+
+    /// Typed wrapper around [`packetout`](Self::packetout) returning [`PacketOut`].
+    #[must_use]
+    pub fn next_packet(&mut self) -> PacketOut<'_> {
+        match self.packetout() {
+            (1, Some(packet)) => PacketOut::Packet(packet),
+            (-1, _) => PacketOut::Hole,
+            _ => PacketOut::NeedData,
+        }
+    }
+
+    /// Typed wrapper around [`packetpeek`](Self::packetpeek) returning
+    /// [`PacketOut`].
+    #[must_use]
+    pub fn peek_packet(&mut self) -> PacketOut<'_> {
+        match self.packetpeek() {
+            (1, Some(packet)) => PacketOut::Packet(packet),
+            (-1, _) => PacketOut::Hole,
+            _ => PacketOut::NeedData,
+        }
     }
 }
 
@@ -803,6 +1026,7 @@ impl SyncState {
     /// `ogg_sync_buffer`: room for at least `size` more bytes, to be filled from
     /// its start and then reported with [`wrote`](Self::wrote). Returns `None`, and
     /// the state is cleared, when `size` is more than the C library takes.
+    #[must_use]
     pub fn buffer(&mut self, size: usize) -> Option<&mut [u8]> {
         // First, clear out any space that has been previously returned.
         if self.returned != 0 {
@@ -814,13 +1038,17 @@ impl SyncState {
             self.returned = 0;
         }
 
-        if size as i64 > self.data.len() as i64 - self.fill as i64 {
+        if size > self.data.len() - self.fill {
             // We need to extend the internal buffer.
-            if size as i64 > i64::from(i32::MAX) - 4096 - self.fill as i64 {
+            let Some(total) = self.fill.checked_add(size) else {
+                self.clear();
+                return None;
+            };
+            if total > MAX_SYNC_STORAGE {
                 self.clear();
                 return None;
             }
-            let newsize = size + self.fill + 4096; // An extra page to be nice.
+            let newsize = total + 4096; // An extra page to be nice.
             self.data.resize(newsize, 0);
         }
 
@@ -832,7 +1060,7 @@ impl SyncState {
     /// [`buffer`](Self::buffer)'s room. Returns -1 when that is more than the room
     /// there was.
     pub fn wrote(&mut self, bytes: usize) -> i32 {
-        if self.fill + bytes > self.data.len() {
+        if bytes > self.data.len() - self.fill {
             return -1;
         }
         self.fill += bytes;
@@ -848,6 +1076,37 @@ impl SyncState {
             None => return -1,
         }
         self.wrote(bytes.len())
+    }
+
+    /// Reads up to `chunk_size` bytes from `reader` directly into the internal
+    /// sync buffer and advances the fill mark. Returns `Ok(0)` at EOF (or when
+    /// `chunk_size == 0`).
+    ///
+    /// # Errors
+    ///
+    /// Returns any I/O error reported by `reader`, an `OutOfMemory` error if
+    /// `chunk_size` exceeds the maximum sync buffer capacity, or `InvalidData` if
+    /// `reader` reports more bytes than `chunk_size`.
+    #[cfg(feature = "std")]
+    pub fn read_from<R: std::io::Read>(
+        &mut self,
+        reader: &mut R,
+        chunk_size: usize,
+    ) -> std::io::Result<usize> {
+        let Some(room) = self.buffer(chunk_size) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                "sync buffer size exceeds libogg limit",
+            ));
+        };
+        let n = reader.read(&mut room[..chunk_size])?;
+        if n > chunk_size || self.wrote(n) != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "reader returned more bytes than requested",
+            ));
+        }
+        Ok(n)
     }
 
     fn page(&self) -> Page<'_> {
@@ -933,6 +1192,7 @@ impl SyncState {
     /// above 0, with a page, says a page of that many bytes was found at the
     /// current place. 0 says more data is needed for one. Below 0, that many bytes
     /// were skipped: ask again.
+    #[must_use]
     pub fn pageseek(&mut self) -> (i64, Option<Page<'_>>) {
         let ret = self.pageseek_i();
         if ret > 0 {
@@ -946,6 +1206,7 @@ impl SyncState {
     /// is needed, and -1 where bytes had to be skipped to find the next page (a
     /// hole in the data, reported once: ask again). The page is good until the next
     /// call on this state.
+    #[must_use]
     pub fn pageout(&mut self) -> (i32, Option<Page<'_>>) {
         // All we need to do is verify a page at the head of the stream buffer. If it
         // doesn't verify, we look for the next potential frame.
@@ -967,6 +1228,52 @@ impl SyncState {
             }
 
             // Loop. Keep looking.
+        }
+    }
+
+    /// Typed wrapper around [`pageout`](Self::pageout) returning [`PageOut`].
+    #[must_use]
+    pub fn next_page(&mut self) -> PageOut<'_> {
+        match self.pageout() {
+            (1, Some(page)) => PageOut::Page(page),
+            (-1, _) => PageOut::Hole,
+            _ => PageOut::NeedData,
+        }
+    }
+
+    /// Drains any remaining complete, checksum-valid pages once physical EOF has
+    /// been reached, resyncing past truncated or bogus `"OggS"` headers that
+    /// [`pageout`](Self::pageout) would otherwise hold for more input bytes.
+    #[must_use]
+    pub fn pageout_eof(&mut self) -> Option<Page<'_>> {
+        loop {
+            let page = self.returned;
+            let bytes = self.fill - page;
+            if bytes < 27 {
+                self.returned = self.fill;
+                self.headerbytes = 0;
+                self.bodybytes = 0;
+                return None;
+            }
+            let ret = self.pageseek_i();
+            if ret > 0 {
+                return Some(self.page());
+            }
+            if ret == 0 {
+                // At physical EOF, no more bytes will arrive, so the candidate "OggS" at
+                // `page` cannot form a complete page; skip past it to the next 'O'.
+                self.headerbytes = 0;
+                self.bodybytes = 0;
+                self.unsynced = true;
+                let next = match self.data[page + 1..self.fill]
+                    .iter()
+                    .position(|&byte| byte == b'O')
+                {
+                    Some(found) => page + 1 + found,
+                    None => self.fill,
+                };
+                self.returned = next;
+            }
         }
     }
 
@@ -1029,10 +1336,10 @@ mod tests {
         let mut read = Vec::new();
         for chunk in file.chunks(999) {
             assert_eq!(sync.write(chunk), 0);
-            while let (1, Some(page)) = sync.pageout() {
+            while let PageOut::Page(page) = sync.next_page() {
                 assert_eq!(page.serialno(), 0x1234);
                 assert_eq!(reader.pagein(&page), 0);
-                while let (1, Some(packet)) = reader.packetout() {
+                while let PacketOut::Packet(packet) = reader.next_packet() {
                     assert_eq!(packet.packetno, read.len() as i64);
                     read.push(packet.packet.to_vec());
                 }
@@ -1076,5 +1383,182 @@ mod tests {
             }
         }
         assert_eq!(results, [1, 1, -1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn truncated_page_headers_never_panic() {
+        let mut s = StreamState::new(42);
+        for len in 0..=27 {
+            let mut hdr = vec![0u8; len];
+            if len == 27 {
+                // Claims 5 segments, but header is only 27 bytes!
+                hdr[26] = 5;
+            }
+            let page = Page {
+                header: &hdr,
+                body: &[],
+            };
+            let _ = page.version();
+            let _ = page.continued();
+            let _ = page.bos();
+            let _ = page.eos();
+            let _ = page.granulepos();
+            let _ = page.serialno();
+            let _ = page.pageno();
+            assert_eq!(page.packets(), 0);
+            assert_eq!(s.pagein(&page), -1);
+        }
+        let empty = Page {
+            header: &[],
+            body: &[],
+        };
+        assert_eq!(empty.version(), -1);
+        assert!(!empty.continued());
+        assert!(!empty.bos());
+        assert!(!empty.eos());
+        assert_eq!(empty.granulepos(), -1);
+        assert_eq!(empty.serialno(), 0);
+        assert_eq!(empty.pageno(), -1);
+        assert_eq!(empty.packets(), 0);
+    }
+
+    #[test]
+    fn sync_buffer_and_wrote_overflow_bounds() {
+        let mut sync = SyncState::new();
+        assert!(sync.buffer(usize::MAX).is_none());
+        assert!(sync.buffer((i32::MAX as usize) - 4096 + 1).is_none());
+
+        let room = sync.buffer(64).unwrap();
+        room[..10].fill(b'a');
+        assert_eq!(sync.wrote(10), 0);
+        // `wrote(usize::MAX)` when `fill > 0` must return -1 without overflowing.
+        assert_eq!(sync.wrote(usize::MAX), -1);
+        assert_eq!(sync.wrote(usize::MAX - 5), -1);
+    }
+
+    #[test]
+    fn stream_mode_forbids_mixing_encode_and_decode() {
+        let mut enc = StreamState::new(7);
+        let pkt = Packet::new(b"hello");
+        assert_eq!(pkt.granulepos, -1);
+        assert!(!pkt.bos());
+        assert!(!pkt.eos());
+        assert_eq!(enc.packetin(&pkt), 0);
+        let page = enc.flush().unwrap();
+        let header = page.header.to_vec();
+        let body = page.body.to_vec();
+        let saved_page = Page {
+            header: &header,
+            body: &body,
+        };
+
+        // Decode methods on an encoding stream fail cleanly without corrupting state.
+        assert_eq!(enc.pagein(&saved_page), -1);
+        assert_eq!(enc.packetout(), (0, None));
+        assert_eq!(enc.packetpeek(), (0, None));
+        assert_eq!(enc.next_packet(), PacketOut::NeedData);
+
+        // Reset restores `Idle` mode so the stream can now decode!
+        assert_eq!(enc.reset(), 0);
+        assert_eq!(enc.pagein(&saved_page), 0);
+        // Encode methods on a decoding stream fail cleanly.
+        assert_eq!(enc.packetin(&pkt), -1);
+        assert_eq!(enc.iovecin(&[b"world"], false, 0), -1);
+        assert!(enc.flush().is_none());
+        assert!(enc.pageout().is_none());
+
+        let got = enc.next_packet().into_packet().unwrap();
+        assert_eq!(got.packet, b"hello");
+        assert!(got.bos());
+        assert!(!got.eos());
+    }
+
+    #[test]
+    fn iovecin_overflow_guards() {
+        let mut s = StreamState::new(1);
+        let chunk = vec![0u8; 65_536];
+        // 32,768 * 65,536 == 2^31 > i32::MAX, using only 64 KB of actual backing memory.
+        let iov = vec![chunk.as_slice(); 32_768];
+        assert_eq!(s.iovecin(&iov, false, 0), -1);
+        // Stream remains usable after oversized iovecin is rejected.
+        assert_eq!(s.check(), 0);
+        assert_eq!(s.packetin(&Packet::new(b"ok")), 0);
+    }
+
+    #[test]
+    fn pageout_eof_resyncs_past_truncated_bogus_oggs() {
+        let mut writer = StreamState::new(99);
+        assert_eq!(writer.packetin(&Packet::new(b"header")), 0);
+        let p1 = writer.flush().unwrap();
+        let p1_bytes = [p1.header, p1.body].concat();
+
+        let mut last = Packet::new(b"final packet");
+        last.e_o_s = 1;
+        last.granulepos = 123;
+        assert_eq!(writer.packetin(&last), 0);
+        let p2 = writer.flush().unwrap();
+        let p2_bytes = [p2.header, p2.body].concat();
+
+        // Insert a bogus "OggS" header claiming 200 segments of 255 bytes (51,000-byte body)
+        // right before the small final EOS page at physical EOF!
+        let mut bogus = vec![0u8; 27 + 200];
+        bogus[..4].copy_from_slice(b"OggS");
+        bogus[26] = 200;
+        bogus[27..].fill(255);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&p1_bytes);
+        file.extend_from_slice(&bogus);
+        file.extend_from_slice(&p2_bytes);
+
+        let mut sync = SyncState::new();
+        assert_eq!(sync.write(&file), 0);
+
+        // First page comes out normally.
+        let first = sync.next_page().into_page().unwrap();
+        assert_eq!(first.pageno(), 0);
+
+        // Normal `pageout` stalls waiting for the 51,000-byte body of the bogus "OggS".
+        assert_eq!(sync.next_page(), PageOut::NeedData);
+
+        // At physical EOF, `pageout_eof` skips the truncated bogus "OggS" and recovers `p2`!
+        let recovered = sync.pageout_eof().unwrap();
+        assert_eq!(recovered.pageno(), 1);
+        assert!(recovered.eos());
+        assert_eq!(recovered.granulepos(), 123);
+        assert!(sync.pageout_eof().is_none());
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn std_io_read_from_and_write_to() {
+        let mut writer = StreamState::new(55);
+        let mut pkt = Packet::new(b"io helper payload");
+        pkt.e_o_s = 1;
+        pkt.granulepos = 42;
+        assert_eq!(writer.packetin(&pkt), 0);
+
+        let mut buf = Vec::new();
+        while let Some(page) = writer.flush() {
+            page.write_to(&mut buf).unwrap();
+        }
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let mut sync = SyncState::new();
+        let mut reader = StreamState::new(55);
+        let mut out = Vec::new();
+        loop {
+            let n = sync.read_from(&mut cursor, 16).unwrap();
+            while let PageOut::Page(page) = sync.next_page() {
+                assert_eq!(reader.pagein(&page), 0);
+                while let PacketOut::Packet(p) = reader.next_packet() {
+                    out.push(p.packet.to_vec());
+                }
+            }
+            if n == 0 {
+                break;
+            }
+        }
+        assert_eq!(out, vec![b"io helper payload".to_vec()]);
     }
 }

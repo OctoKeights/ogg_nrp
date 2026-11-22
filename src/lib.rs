@@ -1,7 +1,7 @@
 //! The Ogg container, ported to Rust from libogg 1.3.5 by the Xiph.Org
 //! Foundation (<https://github.com/xiph/ogg>).
 //!
-//! It has two parts, as in the C library:
+//! It has three parts:
 //!
 //! - [`framing`] (the port of `framing.c`): a stream of bytes cut into pages
 //!   with [`SyncState`], and pages turned into packets and packets into pages
@@ -10,6 +10,9 @@
 //!   reads its packets with, least significant bit first ([`PackWriter`],
 //!   [`PackReader`]) and most significant bit first ([`PackWriterB`],
 //!   [`PackReaderB`]).
+//! - [`demux`]: [`OggDemuxer`], a multi-stream demuxer that routes multiplexed
+//!   pages from a [`SyncState`] by serial number to dynamically tracked
+//!   [`StreamState`]s.
 //!
 //! The functions keep the C library's names without their `ogg_` prefixes, as
 //! methods, and return what it returns. Where the C library hands out a pointer
@@ -39,8 +42,12 @@
 //!         if stream.pagein(&page) != 0 {
 //!             continue; // A page of another stream.
 //!         }
-//!         while let (1, Some(packet)) = stream.packetout() {
-//!             found.push(packet.packet.to_vec());
+//!         loop {
+//!             match stream.packetout() {
+//!                 (0, None) => break,
+//!                 (1, Some(packet)) => found.push(packet.packet.to_vec()),
+//!                 _ => {} // -1: a hole before the next packet; keep reading.
+//!             }
 //!         }
 //!     }
 //!     found
@@ -48,12 +55,17 @@
 //! # assert!(packets(&[]).is_empty());
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 // The arithmetic is kept as the C library writes it.
 #![allow(clippy::manual_div_ceil)]
 
+extern crate alloc;
+
 pub mod bitwise;
+pub mod demux;
 pub mod framing;
 
 pub use bitwise::{PackReader, PackReaderB, PackWriter, PackWriterB};
-pub use framing::{Packet, Page, StreamState, SyncState, page_checksum_set};
+pub use demux::OggDemuxer;
+pub use framing::{Packet, PacketOut, Page, PageOut, StreamState, SyncState, page_checksum_set};
