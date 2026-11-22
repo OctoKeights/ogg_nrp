@@ -32,7 +32,7 @@ packers a codec reads and writes its packets with.
 
 ```toml
 [dependencies]
-ogg_nrp = "0.1"
+ogg_nrp = "0.2"
 ```
 
 ## Quick start
